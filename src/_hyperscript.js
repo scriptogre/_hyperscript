@@ -4605,6 +4605,236 @@
             return onFeature;
         });
 
+        // Helper functions for DOM monitoring
+        function setupAttributeWatcher(element, attributeName, effectCallback) {
+            // Create a MutationObserver to watch for attribute changes
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(mutation) {
+                    if (mutation.type === 'attributes' && mutation.attributeName === attributeName) {
+                        effectCallback('@' + attributeName);
+                    }
+                });
+            });
+
+            // Start observing
+            observer.observe(element, {
+                attributes: true,
+                attributeFilter: [attributeName]
+            });
+
+            // Store observer for cleanup
+            if (!element._hyperscriptAttributeObservers) {
+                element._hyperscriptAttributeObservers = [];
+            }
+            element._hyperscriptAttributeObservers.push(observer);
+        }
+
+        function setupPropertyWatcher(element, propertyName, effectCallback) {
+            // Property monitoring has fundamental limitations - user interactions like clicking checkboxes
+            // don't trigger JavaScript property setters. Only programmatic changes work reliably.
+            // This is kept simple and only handles the programmatic case.
+            
+            console.log("Setting up property watcher for", propertyName, "on", element);
+            console.log("Note: Only programmatic property changes will be detected");
+            
+            var originalDescriptor = Object.getOwnPropertyDescriptor(element, propertyName) ||
+                                   Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), propertyName) ||
+                                   { value: element[propertyName], writable: true, enumerable: true, configurable: true };
+
+            var currentValue = element[propertyName];
+
+            Object.defineProperty(element, propertyName, {
+                get: function() {
+                    return currentValue;
+                },
+                set: function(newValue) {
+                    var oldValue = currentValue;
+                    currentValue = newValue;
+                    if (oldValue !== newValue) {
+                        effectCallback('my.' + propertyName);
+                    }
+                },
+                enumerable: originalDescriptor.enumerable,
+                configurable: true
+            });
+
+            if (!element._hyperscriptPropertyDescriptors) {
+                element._hyperscriptPropertyDescriptors = {};
+            }
+            element._hyperscriptPropertyDescriptors[propertyName] = originalDescriptor;
+        }
+
+        parser.addFeature("when", function (parser, runtime, tokens) {
+            if (!tokens.matchToken("when")) return;
+            
+
+            var watchedExpression = null;
+            var displayName = null;
+
+            // Parse single watch expression
+            function parseWatchExpression() {
+                // Check for attribute references first
+                if (tokens.currentToken().type === "ATTRIBUTE_REF") {
+                    var attrRef = tokens.consumeToken();
+                    var attrName = attrRef.value.substring(1); // Remove @ prefix
+                    return {
+                        type: "attribute", 
+                        attribute: attrName,
+                        displayName: attrRef.value
+                    };
+                } else if (tokens.currentToken().type === "SYMBOL") {
+                    // Handle symbols (variables)
+                    var symbol = tokens.consumeToken();
+                    return {
+                        type: "symbol",
+                        name: symbol.value,
+                        displayName: symbol.value
+                    };
+                } else {
+                    // Parse as a general expression for other cases
+                    var parsedExpr = parser.requireElement("expression", tokens, "Expected variable, property, or attribute");
+                    
+                    if (parsedExpr.type === "symbol") {
+                        return {
+                            type: "symbol",
+                            name: parsedExpr.name,
+                            displayName: parsedExpr.name
+                        };
+                    } else if (parsedExpr.type === "propertyAccess" && parsedExpr.root && parsedExpr.root.type === "symbol" && parsedExpr.root.name === "my") {
+                        return {
+                            type: "property",
+                            property: parsedExpr.prop.value,
+                            displayName: "my." + parsedExpr.prop.value
+                        };
+                    } else {
+                        // For other expressions, treat as generic
+                        return {
+                            type: "expression",
+                            expression: parsedExpr,
+                            displayName: parsedExpr.sourceFor ? parsedExpr.sourceFor() : "expression"
+                        };
+                    }
+                }
+            }
+            
+            // Parse the watch expression
+            watchedExpression = parseWatchExpression();
+            displayName = "when " + watchedExpression.displayName;
+
+            tokens.requireToken("changes");
+            var commandList = parser.requireElement("commandList", tokens);
+            parser.ensureTerminated(commandList);
+
+            var whenFeature = {
+                displayName: displayName,
+                start: commandList,
+                execute: function (ctx) {
+                    commandList.execute(ctx);
+                },
+                install: function(element) {
+                    function reactiveEffect(changedVarName) {
+                        // Check if element is still connected to DOM
+                        if (typeof Node !== 'undefined' && element instanceof Node && !element.isConnected) {
+                            // Clean up this effect from all watched variables
+                            watchedVariables.forEach(function(varName) {
+                                if (reactiveEffects.has(varName)) {
+                                    var effectsSet = reactiveEffects.get(varName);
+                                    // Find and remove the effectInfo object for this specific effect
+                                    effectsSet.forEach(function(effectInfo) {
+                                        if (effectInfo.effect === reactiveEffect) {
+                                            effectsSet.delete(effectInfo);
+                                        }
+                                    });
+                                    if (effectsSet.size === 0) {
+                                        reactiveEffects.delete(varName);
+                                    }
+                                }
+                            });
+                            return;
+                        }
+                        
+                        try {
+                            if (commandList.type !== "emptyCommandListCommand") {
+                                // Create context exactly like the 'on' feature does
+                                var ctx = runtime.makeContext(element, whenFeature, element, null);
+                                
+                                // Set up the 'it' variable with the new value of the changed item
+                                if (changedVarName) {
+                                    var changedValue;
+                                    if (changedVarName.startsWith('@')) {
+                                        // Attribute change
+                                        var attrName = changedVarName.substring(1);
+                                        changedValue = element.getAttribute(attrName);
+                                    } else if (changedVarName.startsWith('my.')) {
+                                        // Property change
+                                        var propName = changedVarName.substring(3);
+                                        changedValue = element[propName];
+                                    } else {
+                                        // Variable change
+                                        changedValue = runtime.resolveSymbol(changedVarName, ctx);
+                                    }
+                                    ctx.result = changedValue; // Set 'it' to the changed value
+                                }
+                                
+                                whenFeature.execute(ctx);
+                            }
+                        } catch (e) {
+                            console.error("Error in reactive effect:", e);
+                        }
+                    }
+
+                    var watchedVariables = [];
+                    
+                    // Set up reactive watching for the expression
+                    var expr = watchedExpression;
+                    if (expr.type === "symbol") {
+                        // Variable watching - use existing reactive effects system
+                        var varName = expr.name;
+                        watchedVariables.push(varName);
+
+                        var effectInfo = {
+                            effect: reactiveEffect,    
+                            element: element           
+                        };
+
+                        if (!reactiveEffects.has(varName)) {
+                            reactiveEffects.set(varName, new Set());
+                        }
+                        reactiveEffects.get(varName).add(effectInfo);
+                        
+                    } else if (expr.type === "attribute") {
+                        // Attribute watching using MutationObserver
+                        setupAttributeWatcher(element, expr.attribute, reactiveEffect);
+                        
+                    } else if (expr.type === "property") {
+                        // Property watching using descriptors
+                        setupPropertyWatcher(element, expr.property, reactiveEffect);
+                        
+                    } else if (expr.type === "expression") {
+                        // Generic expression - treat as a symbol for now
+                        watchedVariables.push(expr.displayName);
+                    }
+
+                    // Schedule initial effect check after init features have run
+                    setTimeout(function() {
+                        // Run initial effect for any variable that exists in any scope
+                        watchedVariables.forEach(function(varName) {
+                            var testCtx = runtime.makeContext(element, whenFeature, element, null);
+                            if (runtime.resolveSymbol(varName, testCtx) !== undefined) {
+                                reactiveEffect(varName);
+                            }
+                        });
+                    }, 1);
+                    
+                    element._hyperscriptReactiveEffect = reactiveEffect;
+                    element._hyperscriptReactiveVariables = watchedVariables;
+                }
+            };
+            
+            parser.setParent(commandList, whenFeature);
+            return whenFeature;
+        });
+
         parser.addFeature("def", function (parser, runtime, tokens) {
             if (!tokens.matchToken("def")) return;
             var functionName = parser.requireElement("dotOrColonPath", tokens);
@@ -7454,6 +7684,7 @@
             }
         });
 
+
         config.conversions.dynamicResolvers.push(function (str, node) {
             if (!(str === "Values" || str.indexOf("Values:") === 0)) {
                 return;
@@ -7706,6 +7937,31 @@
      *
      * @typedef {HyperscriptAPI & ((src: string, ctx?: Partial<Context>) => any)} Hyperscript
      */
+
+
+    // Global reactive system state
+    const reactiveEffects = new Map(); // variable name → Set<effect functions>
+
+    // Wrap setSymbol to trigger reactive effects
+    const originalSetSymbol = runtime_.setSymbol;
+    runtime_.setSymbol = function(str, context, type, value) {
+        const result = originalSetSymbol.call(this, str, context, type, value);
+
+        // Trigger reactive effects for this variable name
+        if (reactiveEffects.has(str)) {
+            const effects = reactiveEffects.get(str);
+            effects.forEach(effectInfo => {
+                try {
+                    effectInfo.effect(str); // Pass the variable name to the effect
+                } catch (e) {
+                    console.error("Error in reactive effect:", e);
+                }
+            });
+        }
+
+        return result;
+    };
+
 
     /**
      * @type {Hyperscript}
