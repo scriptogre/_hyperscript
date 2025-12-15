@@ -7340,7 +7340,7 @@
                         }
                     } else {
                         tokens.matchToken("the"); // optional the
-                        var verticalPosition = tokens.matchAnyToken("top", "middle", "bottom");
+                        var verticalPosition = tokens.matchAnyToken("top", "middle", "bottom", "nearest");
                         var horizontalPosition = tokens.matchAnyToken("left", "center", "right");
                         if (verticalPosition || horizontalPosition) {
                             tokens.requireToken("of");
@@ -7372,6 +7372,8 @@
                                 scrollOptions.block = "end";
                             } else if (verticalPosition.value === "middle") {
                                 scrollOptions.block = "center";
+                            } else if (verticalPosition.value === "nearest") {
+                                scrollOptions.block = "nearest";
                             }
                         }
 
